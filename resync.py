@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Copy every Claude Desktop account's Code-session pointers into the signed-in account's folder.
+"""Copy every Claude Desktop account's sessions and Projects into the signed-in account's folders.
 
 The sidebar reads <app-data>/claude-code-sessions/<account>/<org>/local_*.json; transcripts
-(~/.claude/projects/*/<cliSessionId>.jsonl) are shared. Run only while Claude Desktop is closed.
+(~/.claude/projects/*/<cliSessionId>.jsonl) are shared. Projects (internally "spaces") live in
+<app-data>/local-agent-mode-sessions/<account>/<org>/spaces.json. Run only while Claude is closed.
 """
 import argparse, json, os, re, shutil, stat, subprocess, sys, time
 from collections import namedtuple
@@ -14,6 +15,8 @@ LOCAL = re.compile(r"^local_([\w-]+)\.json$")
 DELETED = re.compile(r"^deleted_([\w-]+)$")
 MAIN, LEGACY = "claude-code-sessions", "local-agent-mode-sessions"
 AUDIT = HOME / ".claude" / "session-resync.jsonl"
+SPACES, RSS = "spaces.json", "remote-session-spaces.json"  # Projects + cloud-session folder links
+SEEN = HOME / ".claude" / "session-resync-projects.json"  # project ids per target at last sync
 CLI_MARKS = (".local\\bin", "claude-cli-nodejs", "node_modules", "\\npm\\", "programs\\devin")
 Folder = namedtuple("Folder", "parent kind acct org path n")  # bridge-state.json is never copied
 
@@ -129,6 +132,80 @@ def merged_meta(name, target, srcs, fold):
     return base if json.dumps(base, sort_keys=True) != before else None
 
 
+def valid_space(s):
+    """Mirrors the app's strict Space schema: one bad entry makes it reject the whole file."""
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    return (isinstance(s, dict) and isinstance(s.get("id"), str) and bool(UUID.match(s["id"]))
+            and isinstance(s.get("name"), str) and isinstance(s.get("folders"), list)
+            and isinstance(s.get("projects"), list) and isinstance(s.get("links", []), list)
+            and num(s.get("createdAt")) and num(s.get("updatedAt")))
+
+
+def space_list(d):
+    data = jload(d / SPACES) or {}
+    raw = data.get("spaces")
+    return [s for s in raw if valid_space(s)] if isinstance(raw, list) else []
+
+
+def stamp(s):
+    t = s.get("updatedAt")
+    return t if isinstance(t, (int, float)) and not isinstance(t, bool) else 0
+
+
+def cowork_dir(parent, acct, org):
+    """The app's Projects folder for acct/org: its 8-char short form if present, else full uuids."""
+    short = parent / LEGACY / acct[:8] / org[:8]
+    return short if short.is_dir() and not short.is_symlink() else parent / LEGACY / acct / org
+
+
+def plan_projects(target, srcs, deleted):
+    """(new spaces.json content or None, added names, updated names, total) for the target.
+
+    Union by project id; the newest updatedAt wins; ids the user deleted in this account since
+    the last sync stay deleted. Content is None when nothing changes or the file is unreadable."""
+    dst = target / SPACES
+    base = jload(dst) if dst.exists() else {}
+    if base is None or not isinstance(base.get("spaces", []), list):
+        print(f"warning: {dst} is unreadable; leaving Projects alone", file=sys.stderr)
+        return None, [], [], 0
+    mine = [s for s in base.get("spaces", []) if valid_space(s)]
+    keep_bad = [s for s in base.get("spaces", []) if not valid_space(s)]  # never drop the app's data
+    pos = {s["id"].lower(): i for i, s in enumerate(mine)}
+    orig = list(mine)
+    own = set(pos)
+    for d in srcs:
+        for s in space_list(d):
+            k = s["id"].lower()
+            if k in pos:
+                if stamp(s) > stamp(mine[pos[k]]):
+                    mine[pos[k]] = s
+            elif k not in deleted:
+                pos[k] = len(mine)
+                mine.append(s)
+    added = [mine[i]["name"] for k, i in pos.items() if k not in own]
+    updated = [mine[i]["name"] for k, i in pos.items() if k in own and mine[i] is not orig[i]]
+    if not (added or updated):
+        return None, [], [], len(mine)
+    return {**base, "spaces": mine + keep_bad}, added, updated, len(mine)
+
+
+def plan_rss(target, srcs):
+    """Merged remote-session-spaces.json (cloud session -> project folders), or None if unchanged."""
+    dst = target / RSS
+    base = jload(dst) if dst.exists() else {}
+    if base is None or not isinstance(base.get("entries", []), list):
+        return None
+    ents = list(base.get("entries", []))
+    have = {e.get("sessionId") for e in ents if isinstance(e, dict)}
+    for d in srcs:
+        raw = (jload(d / RSS) or {}).get("entries")
+        for e in raw if isinstance(raw, list) else []:
+            if isinstance(e, dict) and isinstance(e.get("sessionId"), str) and e["sessionId"] not in have:
+                have.add(e["sessionId"])
+                ents.append(e)
+    return {**base, "entries": ents} if len(ents) != len(base.get("entries", [])) else None
+
+
 def put(dst, src=None, data=None):  # write beside, then rename: a crash never leaves a half file
     tmp = dst.with_name(f".resync-{dst.name}.tmp")
     try:
@@ -179,14 +256,18 @@ def run(a):
             return 1
     target = parent / MAIN / acct / org
     srcs = [f.path for f in folders if f.path.resolve() != target.resolve()]
+    ptarget = cowork_dir(parent, acct, org)  # where the app loads Projects for this account
+    psrcs = [f.path for f in folders if f.path.resolve() != ptarget.resolve()]
 
     if a.status or a.dry_run:
         print(f"current account: {short(acct)} (from {how})   target: {short(acct)}/{short(org)}")
         for f in sorted(folders, key=lambda f: -f.n):
-            tag = "  <-- target" if f.path.resolve() == target.resolve() else ""
-            if not (f.n or tag):
+            tag = ("  <-- target (sessions)" if f.path.resolve() == target.resolve() else
+                   "  <-- target (projects)" if f.path.resolve() == ptarget.resolve() else "")
+            np = len(space_list(f.path))
+            if not (f.n or np or tag):
                 continue  # skip empty folders
-            print(f"  {short(f.acct)}/{short(f.org)}  {f.n:4d} pointers  [{f.kind}]{tag}")
+            print(f"  {short(f.acct)}/{short(f.org)}  {f.n:4d} pointers  {np:3d} projects  [{f.kind}]{tag}")
         if len(orgs) > 1:
             print(f"note: account has {len(orgs)} org folders; using the one with the newest pointers")
         if a.status:
@@ -209,11 +290,23 @@ def run(a):
     meta = {n: c for n, fold in (("archived-sessions.idx", fold_archived), ("scheduled-tasks.json", fold_tasks))
             if (c := merged_meta(n, target, srcs, fold)) is not None}
     need_wait = not (target / "waiting-input").is_dir()
-    changed = bool(copy or tcopy or stale or meta or need_wait)
+    pkey = f"{acct}/{org}".lower()
+    seen_all = jload(SEEN) or {}
+    rec = seen_all.get(pkey) if isinstance(seen_all.get(pkey), dict) else {}
+    ids_of = lambda k: {i.lower() for i in rec.get(k) or [] if isinstance(i, str)}
+    now = {s["id"].lower() for s in space_list(ptarget)}
+    pf = jload(ptarget / SPACES) if (ptarget / SPACES).exists() else {}
+    p_ok = pf is not None and isinstance(pf.get("spaces", []), list)  # unreadable: record nothing
+    removed = ((ids_of("removed") | (ids_of("ids") - now)) - now) if p_ok else ids_of("removed")
+    spaces, padd, pupd, ptotal = plan_projects(ptarget, psrcs, removed)
+    rss = plan_rss(ptarget, psrcs)
+    changed = bool(copy or tcopy or stale or meta or need_wait or spaces or rss)
 
     if a.dry_run:
         print(f"plan: copy {len(copy)} pointers + {len(tcopy)} tombstones, remove {len(stale)} stale, "
               f"update {', '.join(meta) or 'no'} metadata")
+        print(f"plan: projects add {len(padd)}" + (f" ({', '.join(padd)})" if padd else "")
+              + f", update {len(pupd)}" + (", link cloud-session folders" if rss else ""))
         print("nothing to do." if not changed else "(dry run: nothing written)")
         return 0
 
@@ -225,12 +318,27 @@ def run(a):
         f.unlink()
     for n, c in meta.items():
         put(target / n, data=c)
+    if spaces or rss:
+        ptarget.mkdir(parents=True, exist_ok=True)
+    if spaces:
+        put(ptarget / SPACES, data=spaces)
+    if rss:
+        put(ptarget / RSS, data=rss)
+    final = sorted({s["id"].lower() for s in space_list(ptarget)})
+    if p_ok and (final or pkey in seen_all):  # remember what this account holds: deletions stick
+        seen_all[pkey] = {"ids": final, "removed": sorted(removed - set(final))}
+        try:
+            put(SEEN, data=seen_all)
+        except OSError as e:
+            print(f"warning: project list not recorded: {e}", file=sys.stderr)
 
     ids = {f.stem for f in (HOME / ".claude" / "projects").glob("*/*.jsonl")}
     sids = [p.get("cliSessionId") for f in files(target) if LOCAL.match(f.name) and (p := jload(f))]
     sids = [s for s in sids if isinstance(s, str) and s]
     print(f"copied {len(copy)} pointers, removed {len(stale)} stale; "
           f"transcripts resolve on disk: {sum(s in ids for s in sids)}/{len(sids)}")
+    print(f"projects: added {len(padd)}, updated {len(pupd)}; this account now has {ptotal}"
+          + (f" ({', '.join(padd)})" if padd else ""))
     if not changed:
         print("already in sync.")
         return 0
@@ -240,10 +348,11 @@ def run(a):
             fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "target": f"{acct}/{org}",
                                  "sources": len(srcs), "copied": len(copy), "tombstones": len(tcopy),
                                  "removed_stale": len(stale), "metadata": list(meta),
+                                 "projects_added": len(padd), "projects_updated": len(pupd),
                                  "forced": a.force}) + "\n")
     except OSError as e:
         print(f"warning: audit log not written: {e}", file=sys.stderr)
-    print("Done. Reopen Claude Desktop - the sidebar reads this index at launch.")
+    print("Done. Reopen Claude Desktop - the sidebar and Projects load at launch.")
     return 0
 
 
