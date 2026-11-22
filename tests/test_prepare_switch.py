@@ -132,6 +132,21 @@ class PrepareTests(unittest.TestCase):
                     resync.prepare_switch(self.root, B, ORG)
         self.assertFalse(self.target.exists())
 
+    def test_preview_runs_while_desktop_is_open_and_writes_nothing(self):
+        # AI Usage's history guard previews every few minutes while Claude Desktop runs.
+        before = self.snapshot(self.root)
+        with mock.patch.object(resync, "claude_running", return_value=True):
+            result = resync.prepare_switch(self.root, B, ORG, dry=True)
+        self.assertTrue(result["ok"] and result["changes"])
+        self.assertEqual(self.snapshot(self.root), before)
+
+    def test_a_chat_deleted_in_the_target_is_never_brought_back(self):
+        self.target.mkdir(parents=True)
+        (self.target / "deleted_one").write_text("1")  # Desktop's own tombstone in the target
+        resync.prepare_switch(self.root, B, ORG)
+        self.assertFalse((self.target / "local_one.json").exists())
+        self.assertEqual(resync.prepare_switch(self.root, B, ORG, dry=True)["changes"], {})
+
     def test_invalid_identity_is_refused(self):
         for acct, org in (("../escape", ORG), (B, ""), (B, "../escape")):
             with self.subTest(acct=acct, org=org), self.assertRaises(RuntimeError):

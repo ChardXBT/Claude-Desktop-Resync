@@ -604,7 +604,8 @@ def prepare_switch(root, account, organization, dry=False, source_roots=()):
     root = Path(root).absolute()
     target = (account.lower(), organization.lower())
     with merge_lock():
-        if claude_running() is not False:
+        # A preview writes nothing, so it is safe while Claude runs (AI Usage's history guard uses it).
+        if not dry and claude_running() is not False:
             raise RuntimeError("Close Claude Desktop before preparing its history.")
         if not root.is_dir() or not ((root / "config.json").is_file() or any((root / tree).is_dir() for tree in (MAIN, COWORK))):
             raise RuntimeError("No local Claude session folders were found.")
