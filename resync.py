@@ -20,7 +20,8 @@ While Claude runs, the signed-in account's folders are add-only: resync never ov
 deletes anything there, because the running app owns them. It only adds what is missing, and it
 reads them to learn about new chats, edits and deletions, which it carries to every other account.
 """
-import argparse, json, os, re, shutil, stat, subprocess, sys, time
+import argparse, json, os, re, shutil, stat, subprocess, sys, tempfile, time
+from contextlib import contextmanager
 from pathlib import Path
 
 HOME = Path.home()
@@ -35,6 +36,7 @@ STATE = HOME / ".claude" / "session-resync-state.json"  # what each folder held 
 AUDIT = HOME / ".claude" / "session-resync.jsonl"
 WLOG = HOME / ".claude" / "session-resync-watch.log"
 LOCK = HOME / ".claude" / "session-resync-watch.lock"
+PASS_LOCK = HOME / ".claude" / "session-resync-pass.lock"
 STARTUP = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming") / \
     r"Microsoft\Windows\Start Menu\Programs\Startup\Claude Resync Watch.lnk"
 CLI_MARKS = (".local\\bin", "claude-cli-nodejs", "node_modules", "\\npm\\", "programs\\devin")
@@ -106,7 +108,9 @@ class Writer:
         if self.dry:
             return
         os.makedirs(lp(Path(dst).parent), exist_ok=True)
-        tmp = Path(dst).with_name(f".resync-{Path(dst).name}.tmp")
+        fd, name = tempfile.mkstemp(prefix=".resync-", suffix=".tmp", dir=lp(Path(dst).parent))
+        os.close(fd)
+        tmp = Path(name)
         try:
             shutil.copy2(lp(src), lp(tmp))  # keeps mtime, so equal copies never re-copy
             os.replace(lp(tmp), lp(dst))
@@ -122,9 +126,10 @@ class Writer:
         if self.dry:
             return
         os.makedirs(lp(Path(dst).parent), exist_ok=True)
-        tmp = Path(dst).with_name(f".resync-{Path(dst).name}.tmp")
+        fd, name = tempfile.mkstemp(prefix=".resync-", suffix=".tmp", dir=lp(Path(dst).parent))
+        tmp = Path(name)
         try:
-            with open(lp(tmp), "w", encoding="utf-8") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=1)
             os.replace(lp(tmp), lp(dst))
         except BaseException:
@@ -212,7 +217,7 @@ def claude_running():
 
 
 # ---------------------------------------------------------------- mirroring
-def mirror_sessions(tree, folders, prot, w, exclude=frozenset()):
+def mirror_sessions(tree, folders, prot, w, exclude=frozenset(), targets=None, carry_deletions=True):
     """Pointers, tombstones and (Cowork) session folders: newest copy wins everywhere.
 
     folders: {pair: path}; prot: pairs that are add-only. Returns {session id: winning path}."""
@@ -233,16 +238,19 @@ def mirror_sessions(tree, folders, prot, w, exclude=frozenset()):
                 sdirs.setdefault(n, []).append(folders[p] / n)
     trees = {n: newest_files(srcs) for n, srcs in sdirs.items()}  # walk each session folder once
     for p, d in folders.items():
+        if targets is not None and p not in targets:
+            continue
         have, guard = listing[p], p in prot
         for n, (src, t) in win.items():
             if n not in have:
                 w.copy(src, d / n, "sessions added")
             elif not guard and have[n][0].st_mtime < t and not same(src, d / n):
                 w.copy(src, d / n, "sessions updated")
-        for n, src in tfiles.items():
-            if n not in have:
-                w.copy(src, d / n, "deletions carried")
-        if not guard:
+        if carry_deletions:
+            for n, src in tfiles.items():
+                if n not in have:
+                    w.copy(src, d / n, "deletions carried")
+        if not guard and carry_deletions:
             for n in have:
                 m = LOCAL.match(n)
                 if m and (m.group(1).lower() in tombs or m.group(1).lower() in exclude):
@@ -443,6 +451,13 @@ def save_state(state):
 
 
 def once(a):
+    if a.status:
+        return _once(a)
+    with merge_lock():
+        return _once(a)
+
+
+def _once(a):
     roots = app_roots()
     if not roots:
         print("No Claude Desktop data found (looked in %APPDATA%\\Claude, %LOCALAPPDATA%\\Claude-Data\\*, "
@@ -507,10 +522,11 @@ def log(msg):
         pass
 
 
-def take_lock():
+def take_lock(path=None):
     """An exclusive lock held for the watcher's lifetime, or None if another watcher holds it."""
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(LOCK, "a+")
+    path = path or LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
     try:
         if os.name == "nt":
             import msvcrt
@@ -533,6 +549,105 @@ def watch_running():
     return True
 
 
+@contextmanager
+def merge_lock():
+    handle = take_lock(PASS_LOCK)
+    if handle is None:
+        raise RuntimeError("Another resync pass is running. Try again in a moment.")
+    try:
+        yield
+    finally:
+        handle.close()
+
+
+def safe_destination(root, path):
+    """Refuse links/junctions in a target path, including its existing ancestors."""
+    root, path = Path(root).absolute(), Path(path).absolute()
+    if not path.is_relative_to(root):
+        raise RuntimeError("Unsafe session destination.")
+    for part in (path, *path.parents):
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0):
+            raise RuntimeError("Linked session destinations are not supported.")
+
+
+class SwitchWriter(Writer):
+    """Only target files change. Keep every replaced file for local recovery."""
+    def __init__(self, dry, root):
+        super().__init__(dry)
+        self.root = Path(root).absolute()
+        self.backup = self.root / "session-switch-backups" / str(time.time_ns())
+
+    def protect(self, dst):
+        safe_destination(self.root, dst)
+        if mtime(dst) is not None:
+            backup = self.backup / Path(dst).absolute().relative_to(self.root)
+            safe_destination(self.root, backup)
+            super().copy(dst, backup, "files backed up")
+
+    def copy(self, src, dst, what):
+        self.protect(dst)
+        super().copy(src, dst, what)
+
+    def data(self, dst, data, what):
+        self.protect(dst)
+        super().data(dst, data, what)
+
+
+def prepare_switch(root, account, organization, dry=False, source_roots=()):
+    """Prepare local history for one account. No deletions, tasks or remote identities."""
+    if not UUID.fullmatch(account) or not UUID.fullmatch(organization):
+        raise RuntimeError("A valid account and organization are required.")
+    root = Path(root).absolute()
+    target = (account.lower(), organization.lower())
+    with merge_lock():
+        if claude_running() is not False:
+            raise RuntimeError("Close Claude Desktop before preparing its history.")
+        if not root.is_dir() or not ((root / "config.json").is_file() or any((root / tree).is_dir() for tree in (MAIN, COWORK))):
+            raise RuntimeError("No local Claude session folders were found.")
+        pairs = sorted(set(pairs_of(root)) | {target})
+        main = {p: folder(root, MAIN, *p) for p in pairs}
+        cow = {p: folder(root, COWORK, *p) for p in pairs}
+        for old_root in source_roots:
+            old_root = Path(old_root).absolute()
+            safe_destination(old_root, old_root)
+            if old_root == root:
+                continue
+            for pair in pairs_of(old_root):
+                key = (str(old_root), *pair)
+                main[key] = folder(old_root, MAIN, *pair)
+                cow[key] = folder(old_root, COWORK, *pair)
+        for path in (main[target], cow[target]):
+            safe_destination(root, path)
+        # Validate the target's Projects before changing even one session file.
+        projects_path = cow[target] / SPACES
+        current = jload(projects_path) if mtime(projects_path) is not None else {"spaces": []}
+        if (current is None or not isinstance(current.get("spaces"), list)
+                or not all(valid_space(s) for s in current["spaces"])):
+            raise RuntimeError("The target Projects file needs manual recovery.")
+        projects = {s["id"].lower(): s for s in current["spaces"]}
+        for d in cow.values():
+            data = jload(d / SPACES) or {}
+            items = data.get("spaces")
+            for s in items if isinstance(items, list) else []:
+                if valid_space(s):
+                    key = s["id"].lower()
+                    if key not in projects or stamp(s) > stamp(projects[key]):
+                        projects[key] = s
+        w = SwitchWriter(dry, root)
+        cowork_ids = {LOCAL.match(n).group(1).lower() for d in cow.values() for n in scan(d) if LOCAL.match(n)}
+        code = mirror_sessions(MAIN, main, set(), w, exclude=cowork_ids, targets={target}, carry_deletions=False)
+        cw = mirror_sessions(COWORK, cow, set(), w, targets={target}, carry_deletions=False)
+        want = list(projects.values())
+        if want != current["spaces"]:
+            w.data(projects_path, {**current, "spaces": want}, "projects merged")
+        return {"protocol": 1, "ok": True, "code": len(code), "cowork": len(cw),
+                "projects": len(projects), "changes": w.n}
+
+
 def watch(a):
     """Mirror forever. The signed-in account stays add-only even when Claude is closed: switching
     happens inside the app, so treating it as live is always safe and needs no process polling."""
@@ -541,20 +656,23 @@ def watch(a):
         print("The background mirror is already running.")
         return 0
     log(f"watch started (pid {os.getpid()}, every {a.interval}s)")
-    state = jload(STATE) or {}
     last_err = None
     while True:
         try:
-            roots = app_roots()
-            who = signed_in(roots) if roots else None
-            w = Writer(False)
-            if who:  # unknown sign-in: write nothing rather than risk the live account's folders
-                for r in roots:
-                    sync(r, who[0] if r == who[1] else None, r == who[1], w, state)
-            if w.n:
-                save_state(state)
-                log(f"signed in {short(who[0]) if who else '?'}: " +
-                    ", ".join(f"{v} {k}" for k, v in sorted(w.n.items())))
+            with merge_lock():
+                roots = app_roots()
+                who = signed_in(roots) if roots else None
+                state = jload(STATE) or {}
+                before = json.dumps(state, sort_keys=True)
+                w = Writer(False)
+                if who:  # unknown sign-in: write nothing rather than risk the live account's folders
+                    for r in roots:
+                        sync(r, who[0] if r == who[1] else None, r == who[1], w, state)
+                if json.dumps(state, sort_keys=True) != before or w.n:
+                    save_state(state)
+                if w.n:
+                    log(f"signed in {short(who[0]) if who else '?'}: " +
+                        ", ".join(f"{v} {k}" for k, v in sorted(w.n.items())))
             last_err = None
         except Exception as e:  # keep running; log each distinct failure once
             msg = f"{type(e).__name__}: {e}"
@@ -623,8 +741,19 @@ def main():
     ap.add_argument("--uninstall", action="store_true", help="stop --watch and remove it from sign-in")
     ap.add_argument("--interval", type=float, default=3.0, help=argparse.SUPPRESS)
     ap.add_argument("--once-for-test", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--prepare-switch", metavar="ACCOUNT", help="prepare one account's local history, without deletions or tasks")
+    ap.add_argument("--organization", help="target organization UUID for --prepare-switch")
+    ap.add_argument("--app-root", type=Path, help="Claude Desktop data folder for --prepare-switch")
+    ap.add_argument("--source-root", type=Path, action="append", default=[], help="read-only old data folder for gateway history recovery")
+    ap.add_argument("--json", action="store_true", help="machine-readable result for --prepare-switch")
     a = ap.parse_args()
     try:
+        if a.prepare_switch:
+            if not a.organization or not a.app_root or a.watch or a.install or a.uninstall or a.status or a.force:
+                raise RuntimeError("Prepare-switch needs an organization and app root, without other commands.")
+            result = prepare_switch(a.app_root, a.prepare_switch, a.organization, a.dry_run, a.source_root)
+            print(json.dumps(result) if a.json else "Local history prepared for the target account.")
+            return 0
         if a.install:
             return install(a)
         if a.uninstall:
@@ -632,8 +761,11 @@ def main():
         if a.watch:
             return watch(a)
         return once(a)
-    except OSError as e:
-        print(f"error: {e}", file=sys.stderr)
+    except (OSError, RuntimeError) as e:
+        if a.prepare_switch and a.json:
+            print(json.dumps({"protocol": 1, "ok": False, "error": "preparation_failed"}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
         return 1
 
 

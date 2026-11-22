@@ -39,6 +39,27 @@ When you switch, the app relaunches on an account that is already up to date.
 
 ## Setup
 
+For AI Usage's seamless Claude Gateway, Resync is **recovery only**. Backend credential
+swaps keep one local history namespace and need no Resync pass or app restart.
+
+Gateway mode uses `%LOCALAPPDATA%\Claude-3p`. To import old local history once, close
+Desktop fully. Read the target account/org from its existing `claude-code-sessions`
+directories, then preview and run:
+
+```powershell
+py resync.py --prepare-switch ACCOUNT --organization ORG --app-root TARGET --source-root OLD --dry-run --json
+py resync.py --prepare-switch ACCOUNT --organization ORG --app-root TARGET --source-root OLD --json
+```
+
+Preparation changes only the target's Code/Cowork history and Projects. Sources stay
+read only. Replaced target files get backups under `session-switch-backups`. It does not
+copy deletions, scheduled tasks, backlog, remote links or bridges. It rejects open Desktop,
+unsafe linked destinations, malformed target Projects, and concurrent merge passes.
+`--source-root` can repeat. Omit it for target-only recovery within one app-data root.
+Machine-readable output contains counts and fixed error codes, never history text.
+
+The full mirror below remains a separate option for explicit first-party account switching.
+
 1. Install Python 3.10+ from [python.org](https://www.python.org/downloads/) (keep the **py launcher** option ticked).
 2. Download this repo (green **Code** button, then **Download ZIP**) and unzip it somewhere permanent.
 3. Double-click **Enable Auto-Sync**. It starts the background mirror now and at every Windows
