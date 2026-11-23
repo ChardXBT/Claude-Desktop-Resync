@@ -42,6 +42,13 @@ When you switch, the app relaunches on an account that is already up to date.
 For AI Usage's seamless Claude Gateway, Resync is **recovery only**. Backend credential
 swaps keep one local history namespace and need no Resync pass or app restart.
 
+It also runs **automatically as a fail-safe**: AI Usage's Claude router checks every 5 minutes
+whether the old first-party history folders changed (for example after Desktop dropped out of
+gateway mode for a while). Unchanged, it does nothing. Changed, it previews the recovery below
+(`--dry-run` writes nothing and works while Claude is open) and runs it once Claude Desktop is
+fully closed. In normal operation it never copies anything. See AI Usage's
+`docs/claude-routing.md`, "History fail-safe".
+
 Gateway mode uses `%LOCALAPPDATA%\Claude-3p`. To import old local history once, close
 Desktop fully. Read the target account/org from its existing `claude-code-sessions`
 directories, then preview and run:
